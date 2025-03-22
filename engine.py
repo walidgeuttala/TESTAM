@@ -1,6 +1,7 @@
 import torch.optim as optim
 from model import *
 import util
+
 class trainer():
     def __init__(self, scaler, in_dim, out_dim, num_nodes, nhid, dropout, device, 
                  lr_mul = 1., n_warmup_steps = 2000, quantile = 0.7, is_quantile = False, warmup_epoch = 0,
@@ -22,34 +23,59 @@ class trainer():
         self.threshold = 0.
         self.use_uncertainty = use_uncertainty
 
+
+    def check_for_nan(self, tensor, var_name):
+        if torch.isnan(tensor).any():
+            raise ValueError(f"{var_name} contains NaN")
+
     def train(self, input, real, cur_epoch):
         self.model.train()
         self.schedule.zero_grad()
-        
-        output, gate, res = self.model(input)
-        predict = self.scaler.inverse_transform(output)
-        #output = [batch_size,out_dim,num_nodes,T]
 
-        ind_loss = self.loss(self.scaler.inverse_transform(res), real.permute(0,2,3,1).unsqueeze(-1), self.threshold, reduce = None)
+        output, gate, res = self.model(input)
+        self.check_for_nan(output, "Output")
+        self.check_for_nan(gate, "Gate")
+        self.check_for_nan(res, "Residual")
+
+        predict = self.scaler.inverse_transform(output)
+        self.check_for_nan(predict, "Predict")
+
+        ind_loss = self.loss(self.scaler.inverse_transform(res), real.permute(0,2,3,1).unsqueeze(-1), self.threshold, reduce=None)
+        self.check_for_nan(ind_loss, "ind_loss")
+        self.check_for_nan(real, "real")
+
         if self.flag:
-            gated_loss = self.loss(predict, real, reduce = None).permute(0,2,3,1)
+            gated_loss = self.loss(predict, real, reduce=None).permute(0,2,3,1)
+            self.check_for_nan(gated_loss, "gated_loss")
             l_worst_avoidance, l_best_choice = self.get_quantile_label(gated_loss, gate, real)
+            self.check_for_nan(l_worst_avoidance, "l_worst_avoidance flag") 
+
         else:
             l_worst_avoidance, l_best_choice = self.get_label(ind_loss, gate, real)
+            self.check_for_nan(l_worst_avoidance, "l_worst_avoidance else") 
 
         if self.use_uncertainty:
-            uncertainty = self.get_uncertainty(real.permute(0,2,3,1), threshold = self.threshold)
-            uncertainty = uncertainty.unsqueeze(dim = -1)
+            uncertainty = self.get_uncertainty(real.permute(0,2,3,1), threshold=self.threshold)
+            uncertainty = uncertainty.unsqueeze(dim=-1)
         else:
             uncertainty = torch.ones_like(gate)
+        self.check_for_nan(uncertainty, "uncertainty") 
 
-        worst_avoidance = -.5 * l_worst_avoidance * torch.log(gate) * (2 - uncertainty)
-        best_choice = -.5 * l_best_choice * torch.log(gate) * uncertainty
+        epsilon = 1e-4
+        self.check_for_nan(l_worst_avoidance, "l_worst_avoidance") 
+
+        worst_avoidance = -.5 * l_worst_avoidance * torch.log(gate + epsilon) * (2 - uncertainty)
+        best_choice = -.5 * l_best_choice * torch.log(gate + epsilon) * uncertainty
+        self.check_for_nan(worst_avoidance, "worst_avoidance") 
+        self.check_for_nan(best_choice, "best_choice") 
 
         if cur_epoch <= self.warmup_epoch:
             loss = ind_loss.mean()
         else:
             loss = ind_loss.mean() + worst_avoidance.mean() + best_choice.mean()
+
+        self.check_for_nan(loss, "Loss")  # Check the final loss for NaN
+
         loss.backward()
 
         if self.clip is not None:
@@ -58,7 +84,8 @@ class trainer():
         self.schedule.step_and_update_lr()
         mape = util.masked_mape(predict, real, self.threshold).item()
         rmse = util.masked_rmse(predict, real, self.threshold).item()
-        return loss.item(),mape,rmse
+
+        return loss.item(), mape, rmse
 
     def eval(self, input, real):
         self.model.eval()
@@ -133,17 +160,60 @@ class trainer():
         return l_worst_avoidance, l_best_choice
 
     def get_label(self, ind_loss, gate, real):
+        self.check_for_nan(ind_loss, "ind_loss")  # Check the final loss for NaN
+        self.check_for_nan(gate, "gate")
+        self.check_for_nan(real, "real")
+
         n_experts = gate.size(-1)
         empty_val = (real.permute(0,2,3,1).unsqueeze(-1).expand_as(gate)) <= self.threshold
+        self.check_for_nan(empty_val, "empty_val")
         max_error = ind_loss.argmax(dim = -1, keepdim = True)
+        self.check_for_nan(max_error, "max_error")
         cur_expert = gate.argmax(dim = -1, keepdim = True)
+        self.check_for_nan(cur_expert, "cur_expert")
         incorrect = max_error == cur_expert
+        self.check_for_nan(incorrect, "incorrect")
         selected = torch.zeros_like(gate).scatter(-1, cur_expert, 1.0)
+        self.check_for_nan(selected, "selected")
         scaling = torch.ones_like(gate) * ind_loss
+        self.check_for_nan(scaling, "scaling")
         scaling = scaling.scatter(-1, max_error, 0.)
-        scaling = scaling / (scaling.sum(dim = -1, keepdim = True)) * (1 - selected)
+        self.check_for_nan(scaling, "scaling")
+        # # Check if 'scaling' contains NaN values
+        # assert not torch.isnan(scaling).any(), "scaling contains NaN values!"
+
+        # # Check if 'selected' contains NaN values
+        # assert not torch.isnan(selected).any(), "selected contains NaN values!"
+
+        # # Check if the sum along the specified dimension is zero (which could cause division by zero)
+        # scaling_sum = scaling.sum(dim=-1, keepdim=True)
+        # assert (scaling_sum != 0).all(), f"scaling.sum(dim=-1) is zero, leading to division by zero: {scaling_sum}"
+
+        # # Check if 'scaling' contains all zeros along a dimension (which would make the sum zero)
+        # assert (scaling.sum(dim=-1, keepdim=True) != 0).all(), "scaling contains all zeros along a dimension, causing division by zero!"
+
+        # # Check if the result of (1 - selected) has NaN values
+        # result_1_minus_selected = 1 - selected
+        # assert not torch.isnan(result_1_minus_selected).any(), "1 - selected contains NaN values!"
+
+        # # Perform the original operation with a small epsilon to avoid division by zero
+        # epsilon = 1e-8
+        # scaling_normalized = scaling / (scaling_sum + epsilon) * (1 - selected)
+
+        # # Check if the result contains NaN values after the operation
+        # assert not torch.isnan(scaling_normalized).any(), "The result of the operation contains NaN values!"
+
+        # print("All checks passed successfully!")
+        # scaling = scaling / (scaling.sum(dim=-1, keepdim=True)) * (1 - selected)
+        epsilon = 1e-8
+        scaling = scaling / (scaling.sum(dim=-1, keepdim=True) + epsilon) * (1 - selected)
+
+
+        self.check_for_nan(scaling, "scaling")
         l_worst_avoidance = torch.where(incorrect, scaling, selected)
+        self.check_for_nan(l_worst_avoidance, "l_worst_avoidance")
         l_worst_avoidance = torch.where(empty_val, torch.zeros_like(gate), l_worst_avoidance)
+        self.check_for_nan(l_worst_avoidance, "l_worst_avoidance")
         l_worst_avoidance = l_worst_avoidance.detach()
         min_error = ind_loss.argmin(dim = -1, keepdim = True)
         correct = min_error == cur_expert

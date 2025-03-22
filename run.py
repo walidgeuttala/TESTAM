@@ -3,11 +3,11 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default = None, type = str, required = True)
-parser.add_argument('--device', default = -1, type = int)
+parser.add_argument('--device', default = 0, type = int)
 parser.add_argument('--exp_id', dest='i', default = 0, help = 'experiment identifier for who want to run experiment multiple time')
 args = parser.parse_args()
 
-device = 'cuda:' + str(args.device)
+device = 'cuda'
 
 BATCH_DICT = {
         'EXPY-TKY': 8,
